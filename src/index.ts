@@ -1,6 +1,26 @@
 import { extractSessionParameters } from './utils';
 import { TranscriberProxy, type TranscriptionMessage } from './transcriberproxy';
 import { Transcriptionator } from './transcriptionator';
+import { WorkerEntrypoint } from 'cloudflare:workers';
+
+export interface DispatcherTranscriptionMessage {
+  sessionId: string;
+  ssrcId: string;
+  text: string;
+  timestamp: number;
+  language?: string;
+}
+
+export interface RPCResponse {
+  success: boolean;
+  dispatched: number;
+  errors?: string[];
+  message?: string;
+}
+
+export interface TranscriptionDispatcher extends WorkerEntrypoint<Env> {
+	 dispatch(message: DispatcherTranscriptionMessage): Promise<RPCResponse>;
+}
 
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
@@ -14,7 +34,7 @@ export default {
 			return new Response('Worker expected GET method', { status: 400 });
 		}
 
-		const { url, sessionId, transcribe, connect } = extractSessionParameters(request.url);
+		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher } = extractSessionParameters(request.url);
 
 		if (!url.pathname.endsWith('/events') && !url.pathname.endsWith('/transcribe')) {
 			return new Response('Bad URL', { status: 400 });
@@ -30,6 +50,7 @@ export default {
 
 			let outbound: WebSocket | undefined;
 			let transcriptionator: DurableObjectStub<Transcriptionator> | undefined;
+			let dispatcher: Service<TranscriptionDispatcher>
 
 			if (connect) {
 				try {
@@ -47,7 +68,12 @@ export default {
 
 			if (sessionId) {
 				// Connect to transcriptionator durable object to relay messages
-				transcriptionator = env.TRANSCRIPTIONATOR.getByName(sessionId);
+				if (useTranscriptionator) {
+					transcriptionator = env.TRANSCRIPTIONATOR.getByName(sessionId);
+				}
+				if (useDispatcher) {
+					dispatcher = env.TRANSCRIPTION_DISPATCHER as Service<TranscriptionDispatcher>;
+				}
 			}
 
 			session.on('closed', () => {
@@ -68,6 +94,16 @@ export default {
 				outbound?.send(message);
 				transcriptionator?.broadcastMessage(message);
 				server.send(message);
+
+				if (useDispatcher) {
+					const dispatcherMessage: DispatcherTranscriptionMessage = {
+						sessionId: sessionId || 'unknown',
+						ssrcId: data.participant.ssrc?.toString() || 'unknown',
+						text: data.transcript.map(t => t.text).join(' '),
+						timestamp: data.timestamp,
+					};
+					ctx.waitUntil(dispatcher?.dispatch(dispatcherMessage));
+				}
 			});
 
 			// Accept the connection and return immediately
