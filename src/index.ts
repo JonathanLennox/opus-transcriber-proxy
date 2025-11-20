@@ -5,7 +5,7 @@ import { WorkerEntrypoint } from 'cloudflare:workers';
 
 export interface DispatcherTranscriptionMessage {
   sessionId: string;
-  ssrcId: string;
+  endpointId: string;
   text: string;
   timestamp: number;
   language?: string;
@@ -110,7 +110,7 @@ export default {
 				if (useDispatcher) {
 					const dispatcherMessage: DispatcherTranscriptionMessage = {
 						sessionId: sessionId || 'unknown',
-						ssrcId: data.participant.ssrc?.toString() || 'unknown',
+						endpointId: data.participant.id || 'unknown',
 						text: data.transcript.map(t => t.text).join(' '),
 						timestamp: data.timestamp,
 					};
@@ -123,6 +123,9 @@ export default {
 									dispatcherMessage,
 								});
 							}
+						}).catch((error) => {
+							const message = error instanceof Error ? error.message : String(error);
+							console.error('Dispatcher RPC failed:', message, dispatcherMessage);
 						})
 					);
 				}
