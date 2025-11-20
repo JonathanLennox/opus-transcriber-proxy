@@ -34,7 +34,10 @@ export default {
 			return new Response('Worker expected GET method', { status: 400 });
 		}
 
-		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher } = extractSessionParameters(request.url);
+		const parameters = extractSessionParameters(request.url);
+		console.log('Session parameters:', JSON.stringify(parameters));
+
+		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher } = parameters
 
 		if (!url.pathname.endsWith('/events') && !url.pathname.endsWith('/transcribe')) {
 			return new Response('Bad URL', { status: 400 });
@@ -70,9 +73,18 @@ export default {
 				// Connect to transcriptionator durable object to relay messages
 				if (useTranscriptionator) {
 					transcriptionator = env.TRANSCRIPTIONATOR.getByName(sessionId);
+					console.log(`Connected to Transcriptionator for sessionId ${sessionId}`);
 				}
 				if (useDispatcher) {
 					dispatcher = env.TRANSCRIPTION_DISPATCHER as Service<TranscriptionDispatcher>;
+					console.log(`Connected to Transcription Dispatcher for sessionId ${sessionId}`);
+				}
+			} else {
+				if (useDispatcher) {
+					console.error('Dispatcher requested but no sessionId provided');
+				}
+				if (useTranscriptionator) {
+					console.error('Transcriptionator requested but no sessionId provided');
 				}
 			}
 
@@ -102,7 +114,17 @@ export default {
 						text: data.transcript.map(t => t.text).join(' '),
 						timestamp: data.timestamp,
 					};
-					ctx.waitUntil(dispatcher?.dispatch(dispatcherMessage));
+					ctx.waitUntil(
+						dispatcher?.dispatch(dispatcherMessage).then((response) => {
+							if (!response.success || response.errors) {
+								console.error('Dispatcher error:', {
+									message: response.message,
+									errors: response.errors,
+									dispatcherMessage,
+								});
+							}
+						})
+					);
 				}
 			});
 
