@@ -4,22 +4,22 @@ import { Transcriptionator } from './transcriptionator';
 import { WorkerEntrypoint } from 'cloudflare:workers';
 
 export interface DispatcherTranscriptionMessage {
-  sessionId: string;
-  endpointId: string;
-  text: string;
-  timestamp: number;
-  language?: string;
+	sessionId: string;
+	endpointId: string;
+	text: string;
+	timestamp: number;
+	language?: string;
 }
 
 export interface RPCResponse {
-  success: boolean;
-  dispatched: number;
-  errors?: string[];
-  message?: string;
+	success: boolean;
+	dispatched: number;
+	errors?: string[];
+	message?: string;
 }
 
 export interface TranscriptionDispatcher extends WorkerEntrypoint<Env> {
-	 dispatch(message: DispatcherTranscriptionMessage): Promise<RPCResponse>;
+	dispatch(message: DispatcherTranscriptionMessage): Promise<RPCResponse>;
 }
 
 export default {
@@ -37,13 +37,17 @@ export default {
 		const parameters = extractSessionParameters(request.url);
 		console.log('Session parameters:', JSON.stringify(parameters));
 
-		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher } = parameters
+		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher, sendBack } = parameters;
 
 		if (!url.pathname.endsWith('/events') && !url.pathname.endsWith('/transcribe')) {
 			return new Response('Bad URL', { status: 400 });
 		}
 
 		if (transcribe) {
+			if (!useTranscriptionator && !useDispatcher && !sendBack && !connect) {
+				return new Response('No transcription output method specified', { status: 400 });
+			}
+
 			const webSocketPair = new WebSocketPair();
 			const [client, server] = Object.values(webSocketPair);
 
@@ -53,7 +57,7 @@ export default {
 
 			let outbound: WebSocket | undefined;
 			let transcriptionator: DurableObjectStub<Transcriptionator> | undefined;
-			let dispatcher: Service<TranscriptionDispatcher>
+			let dispatcher: Service<TranscriptionDispatcher>;
 
 			if (connect) {
 				try {
@@ -94,39 +98,48 @@ export default {
 				server.close();
 			});
 
-			session.on('interim_transcription', (data: TranscriptionMessage) => {
-				const message = JSON.stringify(data);
-				outbound?.send(message);
-				transcriptionator?.broadcastMessage(message);
-				server.send(message);
-			});
+			if (outbound || transcriptionator || sendBack) {
+				session.on('interim_transcription', (data: TranscriptionMessage) => {
+					const message = JSON.stringify(data);
+					outbound?.send(message);
+					transcriptionator?.broadcastMessage(message);
+					if (sendBack) {
+						server.send(message);
+					}
+				});
+			}
 
 			session.on('transcription', (data: TranscriptionMessage) => {
-				const message = JSON.stringify(data);
+				const message = outbound || transcriptionator || sendBack ? JSON.stringify(data) : '';
 				outbound?.send(message);
 				transcriptionator?.broadcastMessage(message);
-				server.send(message);
+				if (sendBack) {
+					server.send(message);
+				}
 
 				if (useDispatcher) {
 					const dispatcherMessage: DispatcherTranscriptionMessage = {
 						sessionId: sessionId || 'unknown',
 						endpointId: data.participant.id || 'unknown',
-						text: data.transcript.map(t => t.text).join(' '),
+						text: data.transcript.map((t) => t.text).join(' '),
 						timestamp: data.timestamp,
 					};
 					ctx.waitUntil(
-						dispatcher?.dispatch(dispatcherMessage).then((response) => {
-							if (!response.success || response.errors) {
-								console.error('Dispatcher error:', {
-									message: response.message,
-									errors: response.errors,
-									dispatcherMessage,
-								});
-							}
-						}).catch((error) => {
-							const message = error instanceof Error ? error.message : String(error);
-							console.error('Dispatcher RPC failed:', message, dispatcherMessage);
-						})
+						dispatcher
+							?.dispatch(dispatcherMessage)
+							.then((response) => {
+								if (!response.success || response.errors) {
+									console.error('Dispatcher error:', {
+										message: response.message,
+										errors: response.errors,
+										dispatcherMessage,
+									});
+								}
+							})
+							.catch((error) => {
+								const message = error instanceof Error ? error.message : String(error);
+								console.error('Dispatcher RPC failed:', message, dispatcherMessage);
+							}),
 					);
 				}
 			});
