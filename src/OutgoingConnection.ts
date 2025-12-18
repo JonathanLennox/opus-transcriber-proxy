@@ -1,5 +1,8 @@
 import { OpusDecoder } from './OpusDecoder/OpusDecoder';
-import type { TranscriptionMessage } from './transcriberproxy';
+import type { TranscriptionMessage, TranscriberProxyOptions } from './transcriberproxy';
+import { getTurnDetectionConfig } from './utils';
+import { writeMetric } from './metrics';
+import { MetricCache } from './MetricCache';
 
 // Type definition augmentation for Uint8Array - Cloudflare Worker's JS has these methods but TypeScript doesn't have
 // declarations for them as of version 5.9.3.
@@ -90,20 +93,37 @@ export class OutgoingConnection {
 
 	private lastTranscriptTime?: number = undefined;
 
+	// Idle commit timeout - forces transcription when audio stops
+	private idleCommitTimeout: ReturnType<typeof setTimeout> | null = null;
+
 	onInterimTranscription?: (message: TranscriptionMessage) => void = undefined;
 	onCompleteTranscription?: (message: TranscriptionMessage) => void = undefined;
 	onClosed?: (tag: string) => void = undefined;
+	onOpenAIError?: (errorType: string, errorMessage: string) => void = undefined;
+	onError?: (tag: string, error: any) => void = undefined;
 
-	constructor(tag: string, env: Env) {
+	private env: Env;
+	private options: TranscriberProxyOptions;
+	private metricCache: MetricCache;
+
+	constructor(tag: string, env: Env, options: TranscriberProxyOptions) {
 		this.setTag(tag);
+		this.env = env;
+		this.options = options;
+		this.metricCache = new MetricCache(env.METRICS);
 
 		this.initializeOpusDecoder();
 		this.initializeOpenAIWebSocket(env);
 	}
 
 	reset(newTag: string) {
+		this.metricCache.flush();
 		if (this.connectionStatus == 'connected') {
 			this.pendingTags.push(newTag);
+
+			const commitMessage = { type: 'input_audio_buffer.commit' };
+			this.openaiWebSocket?.send(JSON.stringify(commitMessage));
+
 			const clearMessage = { type: 'input_audio_buffer.clear' };
 			this.openaiWebSocket?.send(JSON.stringify(clearMessage));
 		} else {
@@ -115,6 +135,10 @@ export class OutgoingConnection {
 		// Reset the pending audio buffer
 		this.pendingAudioFrames = [];
 		this.pendingAudioDataBuffer.resize(0);
+
+		this.lastChunkNo = -1;
+		this.lastTimestamp = -1;
+		this.lastOpusFrameSize = -1;
 	}
 
 	private async initializeOpusDecoder(): Promise<void> {
@@ -132,6 +156,8 @@ export class OutgoingConnection {
 		} catch (error) {
 			console.error(`Failed to create Opus decoder for tag ${this._tag}:`, error);
 			this.decoderStatus = 'failed';
+			this.doClose(true);
+			this.onError?.(this._tag, `Error initializing Opus decoder: ${error instanceof Error ? error.message : String(error)}`);
 		}
 	}
 
@@ -147,6 +173,13 @@ export class OutgoingConnection {
 				console.log(`OpenAI WebSocket connected for tag: ${this._tag}`);
 				this.connectionStatus = 'connected';
 
+				const transcriptionConfig: { model: string; language?: string } = {
+					model: env.OPENAI_MODEL || 'gpt-4o-mini-transcribe',
+				};
+				if (this.options.language !== null) {
+					transcriptionConfig.language = this.options.language;
+				}
+
 				const sessionConfig = {
 					type: 'session.update',
 					session: {
@@ -160,18 +193,11 @@ export class OutgoingConnection {
 								noise_reduction: {
 									type: 'near_field',
 								},
-								transcription: {
-									model: 'gpt-4o-transcribe',
-									language: 'en', // TODO parameterize this
-								},
-								turn_detection: {
-									type: 'server_vad',
-									threshold: 0.5,
-									prefix_padding_ms: 300,
-									silence_duration_ms: 500,
-								},
+								transcription: transcriptionConfig,
+								turn_detection: getTurnDetectionConfig(env),
 							},
 						},
+						include: ['item.input_audio_transcription.logprobs'],
 					},
 				};
 
@@ -188,19 +214,34 @@ export class OutgoingConnection {
 				this.handleOpenAIMessage(event.data);
 			});
 
-			openaiWs.addEventListener('error', (error) => {
-				console.error(`OpenAI WebSocket error for tag ${this._tag}:`, error);
+			openaiWs.addEventListener('error', (event) => {
+				// Extract useful info from ErrorEvent (event.message is often empty for WebSocket errors)
+				const errorMessage = event instanceof ErrorEvent ? event.message || 'WebSocket error' : 'WebSocket error';
+				console.error(`OpenAI WebSocket error for tag ${this._tag}: ${errorMessage}`);
+				writeMetric(this.env.METRICS, {
+					name: 'openai_api_error',
+					worker: 'opus-transcriber-proxy',
+					errorType: 'websocket_error',
+				});
+				this.onOpenAIError?.('websocket_error', 'WebSocket connection error');
 				this.doClose(true);
 				this.connectionStatus = 'failed';
+				this.onError?.(this._tag, `Error connecting to OpenAI service: ${errorMessage}`);
 			});
 
-			openaiWs.addEventListener('close', () => {
-				console.log(`OpenAI WebSocket closed for tag: ${this._tag}`);
+			openaiWs.addEventListener('close', (event) => {
+				console.log(`OpenAI WebSocket closed for tag ${this._tag}: code=${event.code} reason=${event.reason || 'none'} wasClean=${event.wasClean}`);
 				this.doClose(true);
 				this.connectionStatus = 'failed';
 			});
 		} catch (error) {
 			console.error(`Failed to create OpenAI WebSocket connection for tag ${this._tag}:`, error);
+			writeMetric(this.env.METRICS, {
+				name: 'openai_api_error',
+				worker: 'opus-transcriber-proxy',
+				errorType: 'connection_failed',
+			});
+			this.onOpenAIError?.('connection_failed', error instanceof Error ? error.message : 'Unknown error');
 			this.connectionStatus = 'failed';
 		}
 	}
@@ -225,17 +266,27 @@ export class OutgoingConnection {
 			return;
 		}
 
+		this.metricCache.increment({
+			name: 'opus_packet_received',
+			worker: 'opus-transcriber-proxy',
+		});
+
 		if (Number.isInteger(mediaEvent.media?.chunk) && Number.isInteger(mediaEvent.media.timestamp)) {
-			if (this.lastChunkNo != -1 && mediaEvent.media.chunk != this.lastChunkNo - 1) {
+			if (this.lastChunkNo != -1 && mediaEvent.media.chunk != this.lastChunkNo + 1) {
 				const chunkDelta = mediaEvent.media.chunk - this.lastChunkNo;
-				const timestampDelta = mediaEvent.media.timestamp - this.lastTimestamp;
-				if (chunkDelta <= 0 || timestampDelta <= 0) {
-					// Packets reordered, drop this packet
+				if (chunkDelta <= 0) {
+					// Packets reordered or replayed, drop this packet
+					writeMetric(this.env.METRICS, {
+						name: 'opus_packet_discarded',
+						worker: 'opus-transcriber-proxy',
+					});
+
 					return;
 				}
 
 				// Packets lost, do concealment
 				if (this.decoderStatus == 'ready') {
+					const timestampDelta = mediaEvent.media.timestamp - this.lastTimestamp;
 					// TODO: enqueue concealment actions?  Not sure this is needed in practice.
 					this.doConcealment(opusFrame, chunkDelta, timestampDelta);
 				}
@@ -249,6 +300,10 @@ export class OutgoingConnection {
 		} else if (this.decoderStatus === 'pending') {
 			// Queue the binary data until decoder is ready
 			this.pendingOpusFrames.push(opusFrame);
+			this.metricCache.increment({
+				name: 'opus_packet_queued',
+				worker: 'opus-transcriber-proxy',
+			});
 			// console.log(`Queued opus frame for tag: ${this.tag} (queue size: ${this.pendingOpusFrames.length})`);
 		} else {
 			console.log(`Not queueing opus frame for tag: ${this._tag}: decoder ${this.decoderStatus}`);
@@ -261,18 +316,39 @@ export class OutgoingConnection {
 			return;
 		}
 
+		const lostFrames = chunkDelta - 1;
+		if (lostFrames <= 0) {
+			return;
+		}
+		if (this.lastOpusFrameSize <= 0) {
+			// Not sure how we could have gotten here if we've never decoded anything
+			return;
+		}
+
 		/* Make sure numbers make sense */
-		const chunkDeltaInSamples = chunkDelta * this.lastOpusFrameSize;
-		const timestampDeltaInSamples = (timestampDelta / 48000) * 24000;
+		const lostFramesInSamples = lostFrames * this.lastOpusFrameSize;
+		const timestampDeltaInSamples = timestampDelta > 0 ? (timestampDelta / 48000) * 24000 : Infinity;
 		const maxConcealment = 120 * 24; /* 120 ms at 24 kHz */
 
-		const samplesToConceal = Math.min(chunkDeltaInSamples, timestampDeltaInSamples, maxConcealment);
+		const samplesToConceal = Math.min(lostFramesInSamples, timestampDeltaInSamples, maxConcealment);
 
 		try {
 			const concealedAudio = this.opusDecoder.conceal(opusFrame, samplesToConceal);
-			this.sendOrEnqueueDecodedAudio(concealedAudio.pcmData);
+			if (concealedAudio.errors.length > 0) {
+				writeMetric(this.env.METRICS, {
+					name: 'opus_decode_failure',
+					worker: 'opus-transcriber-proxy',
+				});
+			} else {
+				this.sendOrEnqueueDecodedAudio(concealedAudio.pcmData);
+				writeMetric(this.env.METRICS, {
+					name: 'opus_loss_concealment',
+					worker: 'opus-transcriber-proxy',
+				});
+			}
 		} catch (error) {
 			console.error(`Error concealing ${samplesToConceal} samples for tag ${this._tag}:`, error);
+			// Don't call onError for concealment errors, as they may be transient
 		}
 	}
 
@@ -285,6 +361,20 @@ export class OutgoingConnection {
 		try {
 			// Decode the Opus audio data
 			const decodedAudio = this.opusDecoder.decodeFrame(opusFrame);
+			if (decodedAudio.errors.length > 0) {
+				console.error(`Opus decoding errors for tag ${this._tag}:`, decodedAudio.errors);
+				writeMetric(this.env.METRICS, {
+					name: 'opus_decode_failure',
+					worker: 'opus-transcriber-proxy',
+				});
+
+				// Don't call onError for decoding errors, as they may be transient
+				return;
+			}
+			this.metricCache.increment({
+				name: 'opus_packet_decoded',
+				worker: 'opus-transcriber-proxy',
+			});
 			this.lastOpusFrameSize = decodedAudio.samplesDecoded;
 			this.sendOrEnqueueDecodedAudio(decodedAudio.pcmData);
 		} catch (error) {
@@ -312,6 +402,10 @@ export class OutgoingConnection {
 				this.pendingAudioDataBuffer.resize(uint8Data.byteLength);
 				this.pendingAudioData.set(uint8Data);
 			}
+			this.metricCache.increment({
+				name: 'openai_audio_queued',
+				worker: 'opus-transcriber-proxy',
+			});
 		} else {
 			console.log(`Not queueing audio data for tag: ${this._tag}: connection ${this.connectionStatus}`);
 		}
@@ -347,8 +441,14 @@ export class OutgoingConnection {
 			const audioMessageString = JSON.stringify(audioMessage);
 
 			this.openaiWebSocket.send(audioMessageString);
+			this.resetIdleCommitTimeout();
+			this.metricCache.increment({
+				name: 'openai_audio_sent',
+				worker: 'opus-transcriber-proxy',
+			});
 		} catch (error) {
 			console.error(`Failed to send audio to OpenAI for tag ${this._tag}`, error);
+			// TODO should this call onError?
 		}
 	}
 
@@ -375,11 +475,24 @@ export class OutgoingConnection {
 		}
 	}
 
-	private getTranscriptionMessage(transcript: string, timestamp: number, isInterim: boolean): TranscriptionMessage {
+	private getTranscriptionMessage(
+		transcript: string,
+		confidence: number | undefined,
+		timestamp: number,
+		message_id: string,
+		isInterim: boolean,
+	): TranscriptionMessage {
 		const message: TranscriptionMessage = {
-			transcript: [{ text: transcript }],
+			transcript: [
+				{
+					...(confidence !== undefined && { confidence }),
+					text: transcript,
+				},
+			],
 			is_interim: isInterim,
+			message_id,
 			type: 'transcription-result',
+			event: 'transcription-result',
 			participant: this.participant,
 			timestamp,
 		};
@@ -397,10 +510,11 @@ export class OutgoingConnection {
 		}
 		if (parsedMessage.type === 'conversation.item.input_audio_transcription.delta') {
 			const now = Date.now();
-			if (this.lastTranscriptTime !== undefined) {
+			if (this.lastTranscriptTime === undefined) {
 				this.lastTranscriptTime = now;
 			}
-			const transcription = this.getTranscriptionMessage(parsedMessage.delta, now, true);
+			const confidence = parsedMessage.logprobs?.[0]?.logprob !== undefined ? Math.exp(parsedMessage.logprobs[0].logprob) : undefined;
+			const transcription = this.getTranscriptionMessage(parsedMessage.delta, confidence, now, parsedMessage.item_id, true);
 			this.onInterimTranscription?.(transcription);
 		} else if (parsedMessage.type === 'conversation.item.input_audio_transcription.completed') {
 			let transcriptTime;
@@ -410,16 +524,91 @@ export class OutgoingConnection {
 			} else {
 				transcriptTime = Date.now();
 			}
-			const transcription = this.getTranscriptionMessage(parsedMessage.transcript, transcriptTime, false);
+			const confidence = parsedMessage.logprobs?.[0]?.logprob !== undefined ? Math.exp(parsedMessage.logprobs[0].logprob) : undefined;
+			const transcription = this.getTranscriptionMessage(
+				parsedMessage.transcript,
+				confidence,
+				transcriptTime,
+				parsedMessage.item_id,
+				false,
+			);
+			this.clearIdleCommitTimeout();
 			this.onCompleteTranscription?.(transcription);
+		} else if (parsedMessage.type === 'conversation.item.input_audio_transcription.failed') {
+			console.error(`OpenAI failed to transcribe audio for tag ${this._tag}: ${data}`);
+			writeMetric(this.env.METRICS, {
+				name: 'transcription_failure',
+				worker: 'opus-transcriber-proxy',
+			});
 		} else if (parsedMessage.type === 'input_audio_buffer.cleared') {
 			// Reset completed
-			this.setTag(this.pendingTags.shift()!);
+			const nextTag = this.pendingTags.shift();
+			if (nextTag !== undefined) {
+				this.setTag(nextTag);
+			} else {
+				console.error('Received cleared event but no pending tag available.');
+			}
 		} else if (parsedMessage.type === 'error') {
-			console.error(`OpenAI sent error message for ${this._tag}: ${parsedMessage}`);
+			if (parsedMessage.error?.type === 'invalid_request_error' && parsedMessage.error?.code === 'input_audio_buffer_commit_empty') {
+				// This error indicates that we tried to commit an empty audio buffer, which can happen
+				// if the VAD detected speech stopped just before we did a manual commit.  Ignore.
+				// TODO should we log this at all?
+				console.log(`OpenAI reported empty audio buffer commit for ${this._tag}, ignoring.`);
+				return;
+			}
+			console.error(`OpenAI sent error message for ${this._tag}: ${data}`);
+			writeMetric(this.env.METRICS, {
+				name: 'openai_api_error',
+				worker: 'opus-transcriber-proxy',
+				errorType: 'api_error',
+			});
+			this.onOpenAIError?.('api_error', parsedMessage.error?.message || data);
 			this.doClose(true);
+			this.onError?.(this._tag, `OpenAI service sent error message: ${data}`);
+		} else if (
+			parsedMessage.type !== 'session.created' &&
+			parsedMessage.type !== 'session.updated' &&
+			parsedMessage.type !== 'input_audio_buffer.committed' &&
+			parsedMessage.type !== 'input_audio_buffer.speech_started' &&
+			parsedMessage.type !== 'input_audio_buffer.speech_stopped' &&
+			parsedMessage.type !== 'conversation.item.added' &&
+			parsedMessage.type !== 'conversation.item.done'
+		) {
+			// Log unexpected message types that might indicate issues
+			console.warn(`Unhandled OpenAI message type for ${this._tag}: ${parsedMessage.type}`);
 		}
-		// TODO: are there any other messages we care about?
+	}
+
+	private resetIdleCommitTimeout(): void {
+		this.clearIdleCommitTimeout();
+
+		const timeoutSeconds = parseInt(this.env.FORCE_COMMIT_TIMEOUT || '0', 10);
+		if (timeoutSeconds <= 0) {
+			return;
+		}
+
+		this.idleCommitTimeout = setTimeout(() => {
+			this.forceCommit();
+		}, timeoutSeconds * 1000);
+	}
+
+	private clearIdleCommitTimeout(): void {
+		if (this.idleCommitTimeout !== null) {
+			clearTimeout(this.idleCommitTimeout);
+			this.idleCommitTimeout = null;
+		}
+	}
+
+	private forceCommit(): void {
+		if (this.connectionStatus !== 'connected' || !this.openaiWebSocket) {
+			return;
+		}
+
+		console.log(`Forcing commit for idle connection ${this._tag}`);
+		this.metricCache.flush();
+		const commitMessage = { type: 'input_audio_buffer.commit' };
+		this.openaiWebSocket.send(JSON.stringify(commitMessage));
+		this.idleCommitTimeout = null;
 	}
 
 	close(): void {
@@ -427,10 +616,16 @@ export class OutgoingConnection {
 	}
 
 	private doClose(notify: boolean): void {
+		this.clearIdleCommitTimeout();
+		this.metricCache.flush();
 		this.opusDecoder?.free();
-		this.openaiWebSocket?.close();
+		this.opusDecoder = undefined;
 		this.decoderStatus = 'closed';
+
+		this.openaiWebSocket?.close();
+		this.openaiWebSocket = undefined;
 		this.connectionStatus = 'closed';
+
 		if (notify) {
 			this.onClosed?.(this._tag);
 		}

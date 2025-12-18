@@ -5,6 +5,14 @@
 // submodules and compiled into the dist files, may have different
 // licensing terms."
 
+// Provide Node.js globals for emscripten module.  HACK.
+if (typeof globalThis.__filename === 'undefined') {
+	globalThis.__filename = './opus-decoder.js';
+}
+if (typeof globalThis.__dirname === 'undefined') {
+	globalThis.__dirname = '.';
+}
+
 import OpusDecoderModule from '../../dist/opus-decoder.js';
 // @ts-ignore
 import wasm from '../../dist/opus-decoder.wasm';
@@ -68,22 +76,31 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 	static opusModule = new Promise<OpusWasmInstance>((resolve, reject) => {
 		OpusDecoderModule({
 			instantiateWasm(info: WebAssembly.Imports, receive: (instance: WebAssembly.Instance) => void) {
-				let instance = new WebAssembly.Instance(wasm, info);
-				receive(instance);
-				return instance.exports;
+				try {
+					let instance = new WebAssembly.Instance(wasm, info);
+					receive(instance);
+					return instance.exports;
+				} catch (error) {
+					reject(error);
+					throw error;
+				}
 			},
-		}).then((module: any) => {
-			resolve({
-				opus_frame_decoder_create: module._opus_frame_decoder_create,
-				opus_frame_decoder_destroy: module._opus_frame_decoder_destroy,
-				opus_frame_decoder_reset: module._opus_frame_decoder_reset,
-				opus_frame_decode: module._opus_frame_decode,
-				malloc: module._malloc,
-				free: module._free,
-				HEAP: module.wasmMemory.buffer,
-				module,
+		})
+			.then((module: any) => {
+				resolve({
+					opus_frame_decoder_create: module._opus_frame_decoder_create,
+					opus_frame_decoder_destroy: module._opus_frame_decoder_destroy,
+					opus_frame_decoder_reset: module._opus_frame_decoder_reset,
+					opus_frame_decode: module._opus_frame_decode,
+					malloc: module._malloc,
+					free: module._free,
+					HEAP: module.wasmMemory.buffer,
+					module,
+				});
+			})
+			.catch((error) => {
+				reject(error);
 			});
-		});
 	});
 
 	private _sampleRate: OpusDecoderSampleRate;
@@ -98,7 +115,7 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 	private wasm!: OpusWasmInstance;
 	private _input!: TypedArrayAllocation<Uint8Array>;
 	private _output!: TypedArrayAllocation<Int16Array>;
-	private _decoder!: number;
+	private _decoder: number | undefined;
 
 	constructor(
 		options: {
@@ -136,6 +153,8 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 		const wasmInstance = await OpusDecoder.opusModule;
 		this.wasm = wasmInstance;
 
+		console.log('OpusDecoder WASM module loaded');
+
 		this._input = this.allocateTypedArray(this._inputSize, Uint8Array);
 
 		this._output = this.allocateTypedArray(this._channels * this._outputChannelSize, Int16Array);
@@ -150,6 +169,9 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 	}
 
 	reset() {
+		if (this._decoder === undefined) {
+			throw new Error('Decoder freed or not initialized');
+		}
 		this.wasm.opus_frame_decoder_reset(this._decoder);
 	}
 
@@ -174,7 +196,10 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 		});
 		this._pointers.clear();
 
-		this.wasm.opus_frame_decoder_destroy(this._decoder);
+		if (this._decoder !== undefined) {
+			this.wasm.opus_frame_decoder_destroy(this._decoder);
+			this._decoder = undefined;
+		}
 	}
 
 	addError(
@@ -196,6 +221,18 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 
 	decodeFrame(opusFrame: Uint8Array): OpusDecodedAudio<SampleRate extends undefined ? OpusDecoderDefaultSampleRate : SampleRate> {
 		const errors: DecodeError[] = [];
+
+		if (this._decoder === undefined) {
+			this.addError(errors, 'Decoder freed or not initialized', 0, 0, 0, 0);
+			console.error('Decoder freed or not initialized');
+			return {
+				errors,
+				pcmData: new Int16Array(0),
+				channels: this._channels,
+				samplesDecoded: 0,
+				sampleRate: this._sampleRate,
+			} as OpusDecodedAudio<SampleRate extends undefined ? OpusDecoderDefaultSampleRate : SampleRate>;
+		}
 
 		this._input.buf.set(opusFrame);
 
@@ -237,10 +274,23 @@ export class OpusDecoder<SampleRate extends OpusDecoderSampleRate | undefined = 
 		opusFrame: Uint8Array | undefined,
 		samplesToConceal: number,
 	): OpusDecodedAudio<SampleRate extends undefined ? OpusDecoderDefaultSampleRate : SampleRate> {
+		const errors: DecodeError[] = [];
+
+		if (this._decoder === undefined) {
+			this.addError(errors, 'Decoder freed or not initialized', 0, 0, 0, 0);
+			console.error('Decoder freed or not initialized');
+			return {
+				errors,
+				pcmData: new Int16Array(0),
+				channels: this._channels,
+				samplesDecoded: 0,
+				sampleRate: this._sampleRate,
+			} as OpusDecodedAudio<SampleRate extends undefined ? OpusDecoderDefaultSampleRate : SampleRate>;
+		}
+
 		if (samplesToConceal > this._outputChannelSize) {
 			samplesToConceal = this._outputChannelSize;
 		}
-		const errors: DecodeError[] = [];
 		let samplesDecoded: number;
 		let inLength: number;
 		if (opusFrame !== undefined) {

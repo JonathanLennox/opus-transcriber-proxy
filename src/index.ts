@@ -2,6 +2,7 @@ import { extractSessionParameters } from './utils';
 import { TranscriberProxy, type TranscriptionMessage } from './transcriberproxy';
 import { Transcriptionator } from './transcriptionator';
 import { WorkerEntrypoint } from 'cloudflare:workers';
+import { writeMetric } from './metrics';
 
 export interface DispatcherTranscriptionMessage {
 	sessionId: string;
@@ -37,14 +38,14 @@ export default {
 		const parameters = extractSessionParameters(request.url);
 		console.log('Session parameters:', JSON.stringify(parameters));
 
-		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher, sendBack } = parameters;
+		const { url, sessionId, transcribe, connect, useTranscriptionator, useDispatcher, sendBack, sendBackInterim, language } = parameters;
 
 		if (!url.pathname.endsWith('/events') && !url.pathname.endsWith('/transcribe')) {
 			return new Response('Bad URL', { status: 400 });
 		}
 
 		if (transcribe) {
-			if (!useTranscriptionator && !useDispatcher && !sendBack && !connect) {
+			if (!useTranscriptionator && !useDispatcher && !sendBack && !sendBackInterim && !connect) {
 				return new Response('No transcription output method specified', { status: 400 });
 			}
 
@@ -53,7 +54,7 @@ export default {
 
 			server.accept();
 
-			const session = new TranscriberProxy(server, env);
+			const session = new TranscriberProxy(server, env, { language });
 
 			let outbound: WebSocket | undefined;
 			let transcriptionator: DurableObjectStub<Transcriptionator> | undefined;
@@ -61,7 +62,7 @@ export default {
 
 			if (connect) {
 				try {
-					const outbound = new WebSocket(connect, ['transcription']);
+					outbound = new WebSocket(connect, ['transcription']);
 					// TODO: pass auth info to this websocket
 
 					outbound.addEventListener('close', () => {
@@ -98,7 +99,22 @@ export default {
 				server.close();
 			});
 
-			if (outbound || transcriptionator || sendBack) {
+			session.on('error', (tag, error) => {
+				try {
+					const message = `Error in session ${tag}: ${error instanceof Error ? error.message : String(error)}`;
+					console.error(message);
+					outbound?.close(1001, message);
+					transcriptionator?.notifySessionClosed();
+					server.close(1011, message);
+				} catch (closeError) {
+					// Error handlers do not themselves catch errors, so log to console
+					console.error(
+						`Failed to close connections after error in session ${tag}: ${closeError instanceof Error ? closeError.message : String(closeError)}`,
+					);
+				}
+			});
+
+			if (outbound || transcriptionator || sendBackInterim) {
 				session.on('interim_transcription', (data: TranscriptionMessage) => {
 					const message = JSON.stringify(data);
 					outbound?.send(message);
@@ -110,6 +126,13 @@ export default {
 			}
 
 			session.on('transcription', (data: TranscriptionMessage) => {
+				// Track successful transcription
+				writeMetric(env.METRICS, {
+					name: 'transcription_success',
+					worker: 'opus-transcriber-proxy',
+					sessionId: sessionId ?? undefined,
+				});
+
 				const message = outbound || transcriptionator || sendBack ? JSON.stringify(data) : '';
 				outbound?.send(message);
 				transcriptionator?.broadcastMessage(message);
@@ -124,23 +147,25 @@ export default {
 						text: data.transcript.map((t) => t.text).join(' '),
 						timestamp: data.timestamp,
 					};
-					ctx.waitUntil(
-						dispatcher
-							?.dispatch(dispatcherMessage)
-							.then((response) => {
-								if (!response.success || response.errors) {
-									console.error('Dispatcher error:', {
-										message: response.message,
-										errors: response.errors,
-										dispatcherMessage,
-									});
-								}
-							})
-							.catch((error) => {
-								const message = error instanceof Error ? error.message : String(error);
-								console.error('Dispatcher RPC failed:', message, dispatcherMessage);
-							}),
-					);
+					// Note: We intentionally don't use ctx.waitUntil() here because the
+					// ExecutionContext from the initial WebSocket upgrade request becomes
+					// stale after the response is sent. Using it would cause "IoContext
+					// timed out due to inactivity" errors when transcription events fire.
+					dispatcher
+						?.dispatch(dispatcherMessage)
+						.then((response) => {
+							if (!response.success || response.errors) {
+								console.error('Dispatcher error:', {
+									message: response.message,
+									errors: response.errors,
+									dispatcherMessage,
+								});
+							}
+						})
+						.catch((error) => {
+							const message = error instanceof Error ? error.message : String(error);
+							console.error('Dispatcher RPC failed:', message, dispatcherMessage);
+						});
 				}
 			});
 

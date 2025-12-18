@@ -2,11 +2,18 @@ import { OutgoingConnection } from './OutgoingConnection';
 import { EventEmitter } from 'node:events';
 
 export interface TranscriptionMessage {
-	transcript: Array<{ text: string }>;
+	transcript: Array<{ confidence?: number; text: string }>;
 	is_interim: boolean;
+	language?: string;
+	message_id: string;
 	type: 'transcription-result';
+	event: 'transcription-result';
 	participant: { id: string; ssrc?: string };
 	timestamp: number;
+}
+
+export interface TranscriberProxyOptions {
+	language: string | null;
 }
 
 export class TranscriberProxy extends EventEmitter {
@@ -18,11 +25,13 @@ export class TranscriberProxy extends EventEmitter {
 	// three concurrent speakers.
 	private MAX_OUTGOING_CONNECTIONS = 4;
 	private env: Env;
+	private options: TranscriberProxyOptions;
 
-	constructor(ws: WebSocket, env: Env) {
-		super();
+	constructor(ws: WebSocket, env: Env, options: TranscriberProxyOptions) {
+		super({ captureRejections: true });
 		this.ws = ws;
 		this.env = env;
+		this.options = options;
 		this.outgoingConnections = new Map<string, OutgoingConnection>();
 
 		this.ws.addEventListener('close', () => {
@@ -38,8 +47,14 @@ export class TranscriberProxy extends EventEmitter {
 				console.error('Failed to parse message as JSON:', parseError);
 				parsedMessage = { raw: event.data, parseError: true };
 			}
-			// TODO: are there any other events that need to be handled?
-			if (parsedMessage && parsedMessage.event === 'media') {
+
+			if (parsedMessage && parsedMessage.event === 'ping') {
+				const pongMessage: { event: string; id?: number } = { event: 'pong' };
+			if (typeof parsedMessage.id === 'number') {
+				pongMessage.id = parsedMessage.id;
+			}
+			this.ws.send(JSON.stringify(pongMessage));
+			} else if (parsedMessage && parsedMessage.event === 'media') {
 				this.handleMediaEvent(parsedMessage);
 			}
 		});
@@ -62,7 +77,7 @@ export class TranscriberProxy extends EventEmitter {
 		}
 
 		if (this.outgoingConnections.size < this.MAX_OUTGOING_CONNECTIONS) {
-			const newConnection = new OutgoingConnection(tag, this.env);
+			const newConnection = new OutgoingConnection(tag, this.env, this.options);
 
 			newConnection.onInterimTranscription = (message) => {
 				this.emit('interim_transcription', message);
@@ -72,6 +87,9 @@ export class TranscriberProxy extends EventEmitter {
 			};
 			newConnection.onClosed = (tag) => {
 				this.outgoingConnections.delete(tag);
+			};
+			newConnection.onError = (tag, error) => {
+				this.emit('error', tag, error);
 			};
 
 			this.outgoingConnections.set(tag, newConnection);

@@ -8,8 +8,13 @@ declare namespace Cloudflare {
 	}
 	interface Env {
 		OPENAI_API_KEY: string;
+		OPENAI_MODEL?: string;
+		OPENAI_TURN_DETECTION?: any;
+		DEBUG?: string;
+		FORCE_COMMIT_TIMEOUT?: string;
 		TRANSCRIPTIONATOR: DurableObjectNamespace<import("./src/index").Transcriptionator>;
 		TRANSCRIPTION_DISPATCHER: Fetcher /* transcription-dispatcher */;
+		METRICS?: AnalyticsEngineDataset;
 	}
 }
 interface Env extends Cloudflare.Env {}

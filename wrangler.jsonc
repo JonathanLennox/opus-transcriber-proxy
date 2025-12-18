@@ -13,6 +13,8 @@
 	"observability": {
 		"enabled": true
 	},
+	"logpush": true,
+	"workers_dev": false,
 	/**
 	 * Smart Placement
 	 * Docs: https://developers.cloudflare.com/workers/configuration/smart-placement/#smart-placement
@@ -28,7 +30,13 @@
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
 	 */
-	// "vars": { "MY_VARIABLE": "production_value" }
+	"vars": {
+		/**
+		After how many seconds of no received audio and no final transcription
+		a flush is triggered.
+		**/
+		"FORCE_COMMIT_TIMEOUT": "2"
+	},
 	/**
 	 * Note: Use secrets to store sensitive data.
 	 * https://developers.cloudflare.com/workers/configuration/secrets/
@@ -43,6 +51,16 @@
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
 	 */
 	"services": [{ "binding": "TRANSCRIPTION_DISPATCHER", "service": "transcription-dispatcher" }],
+	"limits": {
+    	"cpu_ms": 300000,
+  	},
+	/**
+	 * Analytics Engine binding for transcription metrics
+	 * https://developers.cloudflare.com/analytics/analytics-engine/get-started/
+	 */
+	"analytics_engine_datasets": [
+		{ "binding": "METRICS", "dataset": "transcription-metrics" }
+	],
 	"durable_objects": {
         "bindings": [
             {
